@@ -52,13 +52,13 @@ db_service = DatabaseService()
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> User:
-    """Get the current user ID from the token.
+    """Get the current user from the JWT token.
 
     Args:
         credentials: The HTTP authorization credentials containing the JWT token.
 
     Returns:
-        User: The user extracted from the token.
+        User: The authenticated user extracted from the token.
 
     Raises:
         HTTPException: If the token is invalid or missing.
@@ -103,13 +103,13 @@ async def get_current_user(
 async def get_current_session(
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> Session:
-    """Get the current session ID from the token.
+    """Get the current session from the JWT token.
 
     Args:
         credentials: The HTTP authorization credentials containing the JWT token.
 
     Returns:
-        Session: The session extracted from the token.
+        Session: The authenticated session extracted from the token.
 
     Raises:
         HTTPException: If the token is invalid or missing.
@@ -151,6 +151,7 @@ async def get_current_session(
             detail="Invalid token format",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
 
 
 @router.post("/register", response_model=UserResponse)

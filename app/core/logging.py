@@ -85,6 +85,56 @@ def get_log_file_path() -> Path:
     return settings.LOG_DIR / f"{env_prefix}-{datetime.now().strftime('%Y-%m-%d')}.jsonl"
 
 
+class ThinkingStateFilter(logging.Filter):
+    """Filter to only allow thinking state logs."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Filter logs to only show thinking state related logs.
+        
+        Args:
+            record: The log record to filter
+            
+        Returns:
+            bool: True if log should be shown, False otherwise
+        """
+        # Filter out uvicorn/FastAPI HTTP logs
+        if record.name.startswith("uvicorn") or record.name.startswith("fastapi"):
+            return False
+        
+        # Filter out metrics endpoint logs
+        message = record.getMessage()
+        if "/metrics" in message or "GET /metrics" in message:
+            return False
+        
+        # Filter out connection pool and other infrastructure logs
+        if any(keyword in message.lower() for keyword in [
+            "connection_pool",
+            "connect_tcp",
+            "send_request",
+            "receive_response",
+            "response_closed",
+            "close.started",
+            "close.complete",
+            "failed to export span",
+            "invalid credentials",
+        ]):
+            return False
+        
+        # Check if this is a thinking state log
+        thinking_state_events = [
+            "thinking_state_emitted",
+            "thinking_state_completed",
+            "content_chunk_streamed",
+        ]
+        
+        for event_name in thinking_state_events:
+            if event_name in message:
+                return True
+        
+        # Filter out all other logs
+        return False
+
+
 class JsonlFileHandler(logging.Handler):
     """Custom handler for writing JSONL logs to daily files."""
 
@@ -121,6 +171,35 @@ class JsonlFileHandler(logging.Handler):
     def close(self) -> None:
         """Close the handler."""
         super().close()
+
+
+def filter_thinking_state_only(logger: Any, method_name: str, event_dict: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Filter processor to only allow thinking state logs in console output.
+    
+    Args:
+        logger: The logger instance
+        method_name: The name of the logging method
+        event_dict: The event dictionary
+        
+    Returns:
+        Optional[Dict[str, Any]]: Event dictionary if allowed, None to drop event
+    """
+    # Get event name
+    event_name = event_dict.get("event", "")
+    
+    # Allow thinking state events
+    thinking_state_events = [
+        "thinking_state_emitted",
+        "thinking_state_completed",
+        "content_chunk_streamed",
+    ]
+    
+    if any(event in event_name for event in thinking_state_events):
+        return event_dict
+    
+    # Drop all other events by returning None
+    # structlog processors can return None to drop events
+    return None
 
 
 def get_structlog_processors(include_file_info: bool = True) -> List[Any]:
@@ -179,9 +258,10 @@ def setup_logging() -> None:
     file_handler = JsonlFileHandler(get_log_file_path())
     file_handler.setLevel(log_level)
 
-    # Create console handler
+    # Create console handler with thinking state filter
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(log_level)
+    console_handler.addFilter(ThinkingStateFilter())
 
     # Get shared processors
     shared_processors = get_structlog_processors(
@@ -200,6 +280,8 @@ def setup_logging() -> None:
     # Configure structlog based on environment
     if settings.LOG_FORMAT == "console":
         # Development-friendly console logging
+        # Note: Removed thinking state filter as it was causing issues with structlog processors
+        # All logs will be shown in console for development
         structlog.configure(
             processors=[
                 *shared_processors,

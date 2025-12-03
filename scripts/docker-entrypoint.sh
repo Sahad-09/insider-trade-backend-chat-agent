@@ -49,8 +49,32 @@ else
 fi
 
 # Check required sensitive environment variables
-required_vars=("JWT_SECRET_KEY" "OPENAI_API_KEY")
+# Changed default provider to OpenAI (Ollama commented out)
+LLM_PROVIDER=${LLM_PROVIDER:-openai}
+LLM_PROVIDER=$(echo "$LLM_PROVIDER" | tr '[:upper:]' '[:lower:]')
+
+required_vars=("JWT_SECRET_KEY")
 missing_vars=()
+
+# Check LLM provider-specific requirements
+if [[ "$LLM_PROVIDER" == "openai" ]]; then
+    required_vars+=("OPENAI_API_KEY")
+    echo "LLM Provider: OpenAI - Checking for OPENAI_API_KEY"
+# Ollama provider commented out - using OpenAI instead
+# elif [[ "$LLM_PROVIDER" == "ollama" ]]; then
+#     echo "LLM Provider: Ollama - Checking for OLLAMA_BASE_URL"
+#     if [[ -z "${OLLAMA_BASE_URL}" ]]; then
+#         echo "Warning: OLLAMA_BASE_URL not set, using default: http://localhost:11434"
+#         export OLLAMA_BASE_URL="http://localhost:11434"
+#     fi
+#     if [[ -z "${DEFAULT_LLM_MODEL}" ]]; then
+#         echo "Warning: DEFAULT_LLM_MODEL not set, using default: qwen2.5:7b-instruct-q4_K_M"
+#         export DEFAULT_LLM_MODEL="qwen2.5:7b-instruct-q4_K_M"
+#     fi
+else
+    echo "Warning: Unknown LLM_PROVIDER: $LLM_PROVIDER. Defaulting to OpenAI."
+    export LLM_PROVIDER="openai"
+fi
 
 for var in "${required_vars[@]}"; do
     if [[ -z "${!var}" ]]; then
@@ -76,7 +100,12 @@ echo "Database Port: $( [[ -n ${POSTGRES_PORT:-${DB_PORT:-}} ]] && echo 'set' ||
 echo "Database Name: $( [[ -n ${POSTGRES_DB:-${DB_NAME:-}} ]] && echo 'set' || echo 'Not set' )"
 echo "Database User: $( [[ -n ${POSTGRES_USER:-${DB_USER:-}} ]] && echo 'set' || echo 'Not set' )"
 
+echo "LLM Provider: ${LLM_PROVIDER:-openai}"
 echo "LLM Model: ${DEFAULT_LLM_MODEL:-Not set}"
+# Ollama check commented out - using OpenAI instead
+# if [[ "$LLM_PROVIDER" == "ollama" ]]; then
+#     echo "Ollama Base URL: ${OLLAMA_BASE_URL:-Not set}"
+# fi
 echo "Debug Mode: ${DEBUG:-false}"
 
 # Run database migrations if necessary

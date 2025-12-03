@@ -26,7 +26,7 @@ from app.schemas.chat import (
     ChatRequest,
     ChatResponse,
     Message,
-    StreamResponse,
+    StreamThinkingResponse,
 )
 
 router = APIRouter()
@@ -77,7 +77,7 @@ async def chat_stream(
     chat_request: ChatRequest,
     session: Session = Depends(get_current_session),
 ):
-    """Process a chat request using LangGraph with streaming response.
+    """Process a chat request using LangGraph with streaming thinking states as SSE events.
 
     Args:
         request: The FastAPI request object for rate limiting.
@@ -85,7 +85,7 @@ async def chat_stream(
         session: The current session from the auth token.
 
     Returns:
-        StreamingResponse: A streaming response of the chat completion.
+        StreamingResponse: Server-Sent Events stream with thinking states.
 
     Raises:
         HTTPException: If there's an error processing the request.
@@ -97,28 +97,60 @@ async def chat_stream(
             message_count=len(chat_request.messages),
         )
 
+        # Get model name safely for metrics
+        current_llm = agent.llm_service.get_llm()
+        model_name = (
+            getattr(current_llm, "model", None)
+            or getattr(current_llm, "model_name", None)
+            or settings.DEFAULT_LLM_MODEL
+        )
+
         async def event_generator():
-            """Generate streaming events.
+            """Generate SSE events with thinking states.
 
             Yields:
                 str: Server-sent events in JSON format.
-
-            Raises:
-                Exception: If there's an error during streaming.
             """
             try:
-                full_response = ""
-                with llm_stream_duration_seconds.labels(model=agent.llm_service.get_llm().get_name()).time():
-                    async for chunk in agent.get_stream_response(
+                # Choose between o3-mini reasoning or regular model based on request
+                if chat_request.use_reasoning:
+                    # Use o3-mini with reasoning
+                    logger.info(
+                        "using_o3_mini_reasoning",
+                        session_id=session.id,
+                        reasoning_effort=chat_request.reasoning_effort,
+                    )
+                    stream_generator = agent.get_response_with_reasoning(
+                        chat_request.messages,
+                        session.id,
+                        user_id=session.user_id,
+                        reasoning_effort=chat_request.reasoning_effort,
+                    )
+                    used_model = "o3-mini"
+                else:
+                    # Use regular model (gpt-4o-mini)
+                    stream_generator = agent.get_stream_response_with_thinking(
                         chat_request.messages, session.id, user_id=session.user_id
-                    ):
-                        full_response += chunk
-                        response = StreamResponse(content=chunk, done=False)
+                    )
+                    used_model = model_name
+                
+                with llm_stream_duration_seconds.labels(model=used_model).time():
+                    async for thinking_state in stream_generator:
+                        # Format as StreamThinkingResponse and emit as SSE
+                        response = StreamThinkingResponse(
+                            thinking_title=thinking_state.get("thinking_title", ""),
+                            response=thinking_state.get("response", ""),
+                            status=thinking_state.get("status", "thinking"),
+                            reasoning=thinking_state.get("reasoning", []),
+                            model=thinking_state.get("model", used_model),
+                        )
                         yield f"data: {json.dumps(response.model_dump())}\n\n"
 
-                # Send final message indicating completion
-                final_response = StreamResponse(content="", done=True)
-                yield f"data: {json.dumps(final_response.model_dump())}\n\n"
+                logger.info(
+                    "stream_chat_request_completed",
+                    session_id=session.id,
+                    model=used_model,
+                )
 
             except Exception as e:
                 logger.error(
@@ -127,7 +159,14 @@ async def chat_stream(
                     error=str(e),
                     exc_info=True,
                 )
-                error_response = StreamResponse(content=str(e), done=True)
+                # Emit error as final event
+                error_response = StreamThinkingResponse(
+                    thinking_title="",
+                    response=str(e),
+                    status="done",
+                    reasoning=[],
+                    model="error",
+                )
                 yield f"data: {json.dumps(error_response.model_dump())}\n\n"
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")

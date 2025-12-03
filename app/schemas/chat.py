@@ -56,12 +56,21 @@ class ChatRequest(BaseModel):
 
     Attributes:
         messages: List of messages in the conversation.
+        use_reasoning: Whether to use o3-mini reasoning model (optional).
     """
 
     messages: List[Message] = Field(
         ...,
         description="List of messages in the conversation",
         min_length=1,
+    )
+    use_reasoning: bool = Field(
+        default=False,
+        description="Use o3-mini reasoning model for more complex reasoning tasks"
+    )
+    reasoning_effort: Literal["low", "medium", "high"] = Field(
+        default="medium",
+        description="Reasoning effort level for o3-mini (only used when use_reasoning=True)"
     )
 
 
@@ -85,3 +94,21 @@ class StreamResponse(BaseModel):
 
     content: str = Field(default="", description="The content of the current chunk")
     done: bool = Field(default=False, description="Whether the stream is complete")
+
+
+class StreamThinkingResponse(BaseModel):
+    """Response model for streaming chat endpoint with thinking states.
+
+    Attributes:
+        thinking_title: The title/description of the current thinking state.
+        response: The response content (empty during thinking, filled when done).
+        status: The status of the stream ("thinking", "reasoning", or "done").
+        reasoning: List of reasoning steps from o3-mini model (optional).
+        model: The model used to generate this response (optional).
+    """
+
+    thinking_title: str = Field(default="", description="The title/description of the current thinking state")
+    response: str = Field(default="", description="The response content")
+    status: Literal["thinking", "reasoning", "done"] = Field(..., description="The status of the stream")
+    reasoning: List[str] = Field(default_factory=list, description="Reasoning steps from o3-mini model")
+    model: str = Field(default="", description="The model used to generate this response")
