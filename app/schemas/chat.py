@@ -57,6 +57,7 @@ class ChatRequest(BaseModel):
     Attributes:
         messages: List of messages in the conversation.
         use_reasoning: Whether to use o3-mini reasoning model (optional).
+        deep_analysis: Whether to use deep analysis mode with SEC analyst.
     """
 
     messages: List[Message] = Field(
@@ -71,6 +72,10 @@ class ChatRequest(BaseModel):
     reasoning_effort: Literal["low", "medium", "high"] = Field(
         default="medium",
         description="Reasoning effort level for o3-mini (only used when use_reasoning=True)"
+    )
+    deep_analysis: bool = Field(
+        default=False,
+        description="Use deep analysis mode with specialized SEC insider trading analyst"
     )
 
 

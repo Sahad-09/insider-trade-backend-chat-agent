@@ -3,6 +3,7 @@
 import asyncio
 from typing import (
     AsyncGenerator,
+    Literal,
     Optional,
 )
 from urllib.parse import quote_plus
@@ -37,7 +38,7 @@ from app.core.config import (
 from app.core.langgraph.tools import tools
 from app.core.logging import logger
 from app.core.metrics import llm_inference_duration_seconds
-from app.core.prompts import load_system_prompt
+from app.core.prompts import load_insider_analyst_prompt, load_system_prompt
 from app.schemas import (
     GraphState,
     Message,
@@ -48,6 +49,14 @@ from app.utils import (
     prepare_messages,
     process_llm_response,
 )
+
+# Keywords that suggest insider trading queries
+INSIDER_KEYWORDS = [
+    "insider", "form 4", "sec filing", "insider trading", "insider purchase",
+    "insider sale", "insider buy", "insider sell", "cluster buying", "executive",
+    "officer", "director", "10% owner", "beneficial owner", "sec", "filing",
+    "insider activity", "insider transaction", "form4", "insider report",
+]
 
 
 class LangGraphAgent:
@@ -77,30 +86,7 @@ class LangGraphAgent:
         if self.memory is None:
             # Configure LLM provider for memory
             llm_config = {"model": settings.LONG_TERM_MEMORY_MODEL}
-            # Ollama provider commented out - using OpenAI instead
-            # if settings.LONG_TERM_MEMORY_PROVIDER == "ollama":
-            #     llm_config["base_url"] = settings.OLLAMA_BASE_URL
 
-            # Configure embedder based on provider
-            # Ollama provider commented out - using OpenAI instead
-            # if settings.LONG_TERM_MEMORY_PROVIDER == "ollama":
-            #     # Use Ollama for embeddings when using Ollama provider
-            #     embedder_provider = "ollama"
-            #     # Use an Ollama-compatible embedding model (default: nomic-embed-text)
-            #     embedder_model = settings.LONG_TERM_MEMORY_EMBEDDER_MODEL
-            #     # If using OpenAI model name, default to Ollama embedding model
-            #     if "text-embedding" in embedder_model.lower() or "ada" in embedder_model.lower():
-            #         embedder_model = "nomic-embed-text"  # Default Ollama embedding model
-            #         logger.info(
-            #             "using_ollama_embedding_model",
-            #             original_model=settings.LONG_TERM_MEMORY_EMBEDDER_MODEL,
-            #             using_model=embedder_model,
-            #         )
-            #     embedder_config = {
-            #         "model": embedder_model,
-            #         "base_url": settings.OLLAMA_BASE_URL,
-            #     }
-            # else:
             # Use OpenAI for embeddings (default)
             embedder_provider = "openai"
             embedder_config = {"model": settings.LONG_TERM_MEMORY_EMBEDDER_MODEL}
@@ -129,31 +115,8 @@ class LangGraphAgent:
                         "config": llm_config,
                     },
                     "embedder": {"provider": embedder_provider, "config": embedder_config},
-                    # "custom_fact_extraction_prompt": load_custom_fact_extraction_prompt(),
                 }
             )
-            # Original OpenAI-only configuration (commented out):
-            # self.memory = await AsyncMemory.from_config(
-            #     config_dict={
-            #         "vector_store": {
-            #             "provider": "pgvector",
-            #             "config": {
-            #                 "collection_name": settings.LONG_TERM_MEMORY_COLLECTION_NAME,
-            #                 "dbname": settings.POSTGRES_DB,
-            #                 "user": settings.POSTGRES_USER,
-            #                 "password": settings.POSTGRES_PASSWORD,
-            #                 "host": settings.POSTGRES_HOST,
-            #                 "port": settings.POSTGRES_PORT,
-            #             },
-            #         },
-            #         "llm": {
-            #             "provider": "openai",
-            #             "config": {"model": settings.LONG_TERM_MEMORY_MODEL},
-            #         },
-            #         "embedder": {"provider": "openai", "config": {"model": settings.LONG_TERM_MEMORY_EMBEDDER_MODEL}},
-            #         # "custom_fact_extraction_prompt": load_custom_fact_extraction_prompt(),
-            #     }
-            # )
         return self.memory
 
     async def _get_connection_pool(self) -> AsyncConnectionPool:
@@ -235,6 +198,67 @@ class LangGraphAgent:
                 exc_info=True,
             )
 
+    def _classify_query(self, query: str) -> Literal["chat", "insider_analyst"]:
+        """Classify if a query is about insider trading.
+
+        Args:
+            query: The user's query text.
+
+        Returns:
+            "insider_analyst" if query is about insider trading, "chat" otherwise.
+        """
+        query_lower = query.lower()
+        for keyword in INSIDER_KEYWORDS:
+            if keyword in query_lower:
+                return "insider_analyst"
+        return "chat"
+
+    async def _router(self, state: GraphState, config: RunnableConfig) -> Command:
+        """Route the query to the appropriate node based on content and settings.
+
+        Args:
+            state: The current graph state.
+            config: The runnable configuration.
+
+        Returns:
+            Command with routing decision.
+        """
+        session_id = config.get("configurable", {}).get("thread_id", "unknown")
+        
+        # Get the last user message for classification
+        last_message = ""
+        for msg in reversed(state.messages):
+            if hasattr(msg, "type") and msg.type == "human":
+                last_message = msg.content
+                break
+            elif hasattr(msg, "role") and msg.role == "user":
+                last_message = msg.content
+                break
+            elif isinstance(msg, dict) and msg.get("role") == "user":
+                last_message = msg.get("content", "")
+                break
+
+        # Determine route
+        if state.deep_analysis:
+            # Deep analysis mode always routes to insider_analyst
+            route = "insider_analyst"
+            logger.info(
+                "\033[45m\033[97m[ROUTER]\033[0m deep_analysis_mode_enabled",
+                session_id=session_id,
+                route=route,
+            )
+        else:
+            # Auto-classify based on query content
+            route = self._classify_query(last_message)
+            logger.info(
+                "\033[45m\033[97m[ROUTER]\033[0m query_classified",
+                session_id=session_id,
+                route=route,
+                query_preview=last_message[:100] if last_message else "empty",
+            )
+
+        return Command(update={"route": route}, goto=route)
+
     async def _chat(self, state: GraphState, config: RunnableConfig) -> Command:
         """Process the chat state and generate a response.
 
@@ -268,8 +292,9 @@ class LangGraphAgent:
 
         try:
             # Use LLM service with automatic retries and circular fallback
+            # Note: messages is already a list of dicts from prepare_messages
             with llm_inference_duration_seconds.labels(model=model_name).time():
-                response_message = await self.llm_service.call(dump_messages(messages))
+                response_message = await self.llm_service.call(messages)
 
             # Process response to handle structured content blocks
             response_message = process_llm_response(response_message)
@@ -306,7 +331,85 @@ class LangGraphAgent:
             )
             raise Exception(f"failed to get llm response after trying all models: {str(e)}")
 
-    # Define our tool node
+    async def _insider_analyst(self, state: GraphState, config: RunnableConfig) -> Command:
+        """Process queries using the specialized SEC Insider Trading Analyst.
+
+        This node uses a specialized system prompt for insider trading analysis
+        and provides domain-specific expertise.
+
+        Args:
+            state: The current graph state.
+            config: The runnable configuration.
+
+        Returns:
+            Command with updated messages and routing.
+        """
+        session_id = config.get("configurable", {}).get("thread_id", "unknown")
+        
+        # Colored log for INSIDER ANALYST node (Magenta background)
+        logger.info(
+            "\033[45m\033[97m[INSIDER ANALYST NODE]\033[0m insider_analyst_node_entered",
+            session_id=session_id,
+            message_count=len(state.messages),
+            deep_analysis=state.deep_analysis,
+        )
+        
+        # Get the current LLM instance for metrics
+        current_llm = self.llm_service.get_llm()
+        model_name = (
+            getattr(current_llm, "model_name", None)
+            or getattr(current_llm, "model", None)
+            or settings.DEFAULT_LLM_MODEL
+        )
+
+        # Use the specialized insider analyst prompt
+        SYSTEM_PROMPT = load_insider_analyst_prompt(long_term_memory=state.long_term_memory or "")
+
+        # Prepare messages with specialized system prompt
+        messages = prepare_messages(state.messages, current_llm, SYSTEM_PROMPT)
+
+        try:
+            # Use LLM service with automatic retries
+            # Note: messages is already a list of dicts from prepare_messages
+            with llm_inference_duration_seconds.labels(model=f"{model_name}_analyst").time():
+                response_message = await self.llm_service.call(messages)
+
+            # Process response to handle structured content blocks
+            response_message = process_llm_response(response_message)
+
+            logger.info(
+                "\033[45m\033[97m[INSIDER ANALYST NODE]\033[0m analyst_response_generated",
+                session_id=session_id,
+                model=model_name,
+                has_tool_calls=bool(response_message.tool_calls),
+            )
+
+            # Determine next node based on whether there are tool calls
+            if response_message.tool_calls:
+                logger.info(
+                    "\033[45m\033[97m[INSIDER ANALYST NODE]\033[0m routing_to_analyst_tool_call",
+                    session_id=session_id,
+                    tool_calls_count=len(response_message.tool_calls),
+                    tool_names=[tc.get("name") for tc in response_message.tool_calls],
+                )
+                goto = "analyst_tool_call"
+            else:
+                logger.info(
+                    "\033[45m\033[97m[INSIDER ANALYST NODE]\033[0m routing_to_end",
+                    session_id=session_id,
+                )
+                goto = END
+
+            return Command(update={"messages": [response_message]}, goto=goto)
+        except Exception as e:
+            logger.error(
+                "insider_analyst_failed",
+                session_id=session_id,
+                error=str(e),
+                exc_info=True,
+            )
+            raise Exception(f"insider analyst failed: {str(e)}")
+
     async def _tool_call(self, state: GraphState, config: RunnableConfig) -> Command:
         """Process tool calls from the last message.
 
@@ -335,9 +438,11 @@ class LangGraphAgent:
             # Color mapping for different tools
             tool_colors = {
                 "duckduckgo_search": "\033[43m\033[30m",  # Yellow background, black text
-                "brave_search": "\033[45m\033[97m",  # Magenta background, white text
+                "search_insider_trades_by_symbol": "\033[46m\033[30m",  # Cyan background
+                "get_recent_market_insider_activity": "\033[46m\033[30m",  # Cyan background
+                "get_stock_price": "\033[42m\033[30m",  # Green background
             }
-            tool_color = tool_colors.get(tool_name, "\033[46m\033[97m")  # Cyan default
+            tool_color = tool_colors.get(tool_name, "\033[47m\033[30m")  # White default
             
             logger.info(
                 f"{tool_color}[TOOL: {tool_name.upper()}]\033[0m tool_execution_started",
@@ -366,13 +471,6 @@ class LangGraphAgent:
                     )
                 )
             except Exception as e:
-                # Color mapping for different tools (same as above)
-                tool_colors = {
-                    "duckduckgo_search": "\033[43m\033[30m",  # Yellow background, black text
-                    "brave_search": "\033[45m\033[97m",  # Magenta background, white text
-                }
-                tool_color = tool_colors.get(tool_name, "\033[46m\033[97m")  # Cyan default
-                
                 logger.error(
                     f"{tool_color}[TOOL: {tool_name.upper()}]\033[0m tool_execution_failed",
                     session_id=session_id,
@@ -398,8 +496,90 @@ class LangGraphAgent:
         
         return Command(update={"messages": outputs}, goto="chat")
 
+    async def _analyst_tool_call(self, state: GraphState, config: RunnableConfig) -> Command:
+        """Process tool calls from the insider analyst node.
+
+        Similar to _tool_call but routes back to insider_analyst instead of chat.
+
+        Args:
+            state: The current agent state.
+            config: The runnable configuration.
+
+        Returns:
+            Command with updated messages routing back to insider_analyst.
+        """
+        session_id = config.get("configurable", {}).get("thread_id", "unknown")
+        outputs = []
+        
+        # Colored log for ANALYST TOOL_CALL node (Cyan background)
+        logger.info(
+            "\033[46m\033[97m[ANALYST TOOL_CALL]\033[0m analyst_tool_call_entered",
+            session_id=session_id,
+            tool_count=len(state.messages[-1].tool_calls),
+            tool_names=[tc.get("name") for tc in state.messages[-1].tool_calls],
+        )
+        
+        for tool_call in state.messages[-1].tool_calls:
+            tool_name = tool_call["name"]
+            tool_args = tool_call.get("args", {})
+            
+            logger.info(
+                "\033[46m\033[30m[ANALYST TOOL]\033[0m executing_tool",
+                session_id=session_id,
+                tool_name=tool_name,
+                tool_args=tool_args,
+            )
+            
+            try:
+                tool_result = await self.tools_by_name[tool_name].ainvoke(tool_args)
+                
+                logger.info(
+                    "\033[46m\033[30m[ANALYST TOOL]\033[0m tool_completed",
+                    session_id=session_id,
+                    tool_name=tool_name,
+                    result_length=len(str(tool_result)),
+                )
+                
+                outputs.append(
+                    ToolMessage(
+                        content=tool_result,
+                        name=tool_name,
+                        tool_call_id=tool_call["id"],
+                    )
+                )
+            except Exception as e:
+                logger.error(
+                    "\033[46m\033[30m[ANALYST TOOL]\033[0m tool_failed",
+                    session_id=session_id,
+                    tool_name=tool_name,
+                    error=str(e),
+                    exc_info=True,
+                )
+                outputs.append(
+                    ToolMessage(
+                        content=f"Error executing tool {tool_name}: {str(e)}",
+                        name=tool_name,
+                        tool_call_id=tool_call["id"],
+                    )
+                )
+        
+        logger.info(
+            "\033[46m\033[97m[ANALYST TOOL_CALL]\033[0m routing_back_to_analyst",
+            session_id=session_id,
+            output_count=len(outputs),
+        )
+        
+        # Route back to insider_analyst for analysis of tool results
+        return Command(update={"messages": outputs}, goto="insider_analyst")
+
     async def create_graph(self) -> Optional[CompiledStateGraph]:
         """Create and configure the LangGraph workflow.
+
+        The graph structure:
+        ```
+        [START] -> [router] -> [chat] <-> [tool_call]
+                           |-> [insider_analyst] <-> [analyst_tool_call]
+        ```
 
         Returns:
             Optional[CompiledStateGraph]: The configured LangGraph instance or None if init fails
@@ -407,10 +587,16 @@ class LangGraphAgent:
         if self._graph is None:
             try:
                 graph_builder = StateGraph(GraphState)
+                
+                # Add nodes
+                graph_builder.add_node("router", self._router, ends=["chat", "insider_analyst"])
                 graph_builder.add_node("chat", self._chat, ends=["tool_call", END])
                 graph_builder.add_node("tool_call", self._tool_call, ends=["chat"])
-                graph_builder.set_entry_point("chat")
-                graph_builder.set_finish_point("chat")
+                graph_builder.add_node("insider_analyst", self._insider_analyst, ends=["analyst_tool_call", END])
+                graph_builder.add_node("analyst_tool_call", self._analyst_tool_call, ends=["insider_analyst"])
+                
+                # Set entry point to router
+                graph_builder.set_entry_point("router")
 
                 # Get connection pool (may be None in production if DB unavailable)
                 connection_pool = await self._get_connection_pool()
@@ -432,6 +618,7 @@ class LangGraphAgent:
                     graph_name=f"{settings.PROJECT_NAME} Agent",
                     environment=settings.ENVIRONMENT.value,
                     has_checkpointer=checkpointer is not None,
+                    nodes=["router", "chat", "tool_call", "insider_analyst", "analyst_tool_call"],
                 )
             except Exception as e:
                 logger.error("graph_creation_failed", error=str(e), environment=settings.ENVIRONMENT.value)
@@ -448,6 +635,7 @@ class LangGraphAgent:
         messages: list[Message],
         session_id: str,
         user_id: Optional[str] = None,
+        deep_analysis: bool = False,
     ) -> list[dict]:
         """Get a response from the LLM.
 
@@ -455,6 +643,7 @@ class LangGraphAgent:
             messages (list[Message]): The messages to send to the LLM.
             session_id (str): The session ID for Langfuse tracking.
             user_id (Optional[str]): The user ID for Langfuse tracking.
+            deep_analysis (bool): Whether to use deep analysis mode (insider analyst).
 
         Returns:
             list[dict]: The response from the LLM.
@@ -469,6 +658,7 @@ class LangGraphAgent:
                 "session_id": session_id,
                 "environment": settings.ENVIRONMENT.value,
                 "debug": settings.DEBUG,
+                "deep_analysis": deep_analysis,
             },
         }
         relevant_memory = (
@@ -476,7 +666,11 @@ class LangGraphAgent:
         ) or "No relevant memory found."
         try:
             response = await self._graph.ainvoke(
-                input={"messages": dump_messages(messages), "long_term_memory": relevant_memory},
+                input={
+                    "messages": dump_messages(messages),
+                    "long_term_memory": relevant_memory,
+                    "deep_analysis": deep_analysis,
+                },
                 config=config,
             )
             # Run memory update in background without blocking the response
@@ -487,7 +681,8 @@ class LangGraphAgent:
             )
             return self.__process_messages(response["messages"])
         except Exception as e:
-            logger.error(f"Error getting response: {str(e)}")
+            logger.error("get_response_failed", error=str(e), exc_info=True)
+            raise
 
     async def get_response_with_reasoning(
         self,
@@ -625,7 +820,7 @@ class LangGraphAgent:
         try:
             sent_content = ""  # Track what we've already sent to avoid duplicates
             async for token, _ in self._graph.astream(
-                {"messages": dump_messages(messages), "long_term_memory": relevant_memory},
+                {"messages": dump_messages(messages), "long_term_memory": relevant_memory, "deep_analysis": False},
                 config,
                 stream_mode="messages",
             ):
@@ -674,7 +869,11 @@ class LangGraphAgent:
             raise stream_error
 
     async def get_stream_response_with_thinking(
-        self, messages: list[Message], session_id: str, user_id: Optional[str] = None
+        self,
+        messages: list[Message],
+        session_id: str,
+        user_id: Optional[str] = None,
+        deep_analysis: bool = False,
     ) -> AsyncGenerator[dict, None]:
         """Get a stream response with thinking states from the LLM.
 
@@ -682,6 +881,7 @@ class LangGraphAgent:
             messages (list[Message]): The messages to send to the LLM.
             session_id (str): The session ID for the conversation.
             user_id (Optional[str]): The user ID for the conversation.
+            deep_analysis (bool): Whether to use deep analysis mode.
 
         Yields:
             dict: Thinking state updates with format:
@@ -699,6 +899,7 @@ class LangGraphAgent:
                 "session_id": session_id,
                 "environment": settings.ENVIRONMENT.value,
                 "debug": settings.DEBUG,
+                "deep_analysis": deep_analysis,
             },
         }
         if self._graph is None:
@@ -717,7 +918,11 @@ class LangGraphAgent:
             
             # Stream updates to track node transitions and content
             async for update in self._graph.astream(
-                {"messages": dump_messages(messages), "long_term_memory": relevant_memory},
+                {
+                    "messages": dump_messages(messages),
+                    "long_term_memory": relevant_memory,
+                    "deep_analysis": deep_analysis,
+                },
                 config,
                 stream_mode="updates",
             ):
@@ -734,7 +939,57 @@ class LangGraphAgent:
                         previous_node = node_name
                         
                         # Emit thinking state based on node
-                        if node_name == "chat":
+                        if node_name == "router":
+                            thinking_state = {
+                                "thinking_title": "analyzing query",
+                                "response": "",
+                                "status": "thinking"
+                            }
+                            logger.info(
+                                "thinking_state_emitted",
+                                session_id=session_id,
+                                thinking_title=thinking_state["thinking_title"],
+                                node=node_name,
+                            )
+                            yield thinking_state
+                        
+                        elif node_name == "insider_analyst":
+                            thinking_state = {
+                                "thinking_title": "📊 SEC analyst reviewing data",
+                                "response": "",
+                                "status": "thinking"
+                            }
+                            logger.info(
+                                "thinking_state_emitted",
+                                session_id=session_id,
+                                thinking_title=thinking_state["thinking_title"],
+                                node=node_name,
+                            )
+                            yield thinking_state
+                        
+                        elif node_name == "analyst_tool_call":
+                            # Check what tools are being called
+                            if previous_state_messages:
+                                last_msg = previous_state_messages[-1]
+                                if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+                                    tool_names = [tc.get("name") for tc in last_msg.tool_calls]
+                                    if "search_insider_trades_by_symbol" in tool_names:
+                                        thinking_title = "🔍 fetching SEC Form 4 filings"
+                                    elif "get_recent_market_insider_activity" in tool_names:
+                                        thinking_title = "📈 scanning market insider activity"
+                                    elif "get_stock_price" in tool_names:
+                                        thinking_title = "💹 getting stock price"
+                                    else:
+                                        thinking_title = "🔧 executing analysis tools"
+                                    
+                                    thinking_state = {
+                                        "thinking_title": thinking_title,
+                                        "response": "",
+                                        "status": "thinking"
+                                    }
+                                    yield thinking_state
+                        
+                        elif node_name == "chat":
                             # Check previous state to see if tool calls were made
                             if previous_state_messages:
                                 last_prev_msg = previous_state_messages[-1]
@@ -744,18 +999,10 @@ class LangGraphAgent:
                                     last_tool_name = tool_names[0] if tool_names else None
                                     if "duckduckgo_search" in tool_names:
                                         thinking_state = {
-                                            "thinking_title": "searching web",
+                                            "thinking_title": "🔍 searching web",
                                             "response": "",
                                             "status": "thinking"
                                         }
-                                        logger.info(
-                                            "thinking_state_emitted",
-                                            session_id=session_id,
-                                            thinking_title=thinking_state["thinking_title"],
-                                            status=thinking_state["status"],
-                                            node=node_name,
-                                            tool_names=tool_names,
-                                        )
                                         yield thinking_state
                                     else:
                                         thinking_title = f"using {last_tool_name}" if last_tool_name else "processing"
@@ -764,14 +1011,6 @@ class LangGraphAgent:
                                             "response": "",
                                             "status": "thinking"
                                         }
-                                        logger.info(
-                                            "thinking_state_emitted",
-                                            session_id=session_id,
-                                            thinking_title=thinking_state["thinking_title"],
-                                            status=thinking_state["status"],
-                                            node=node_name,
-                                            tool_names=tool_names,
-                                        )
                                         yield thinking_state
                                 elif current_messages:
                                     # Check if we're generating content
@@ -783,13 +1022,6 @@ class LangGraphAgent:
                                             "response": "",
                                             "status": "thinking"
                                         }
-                                        logger.info(
-                                            "thinking_state_emitted",
-                                            session_id=session_id,
-                                            thinking_title=thinking_state["thinking_title"],
-                                            status=thinking_state["status"],
-                                            node=node_name,
-                                        )
                                         yield thinking_state
                             else:
                                 # First chat node entry
@@ -798,47 +1030,30 @@ class LangGraphAgent:
                                     "response": "",
                                     "status": "thinking"
                                 }
-                                logger.info(
-                                    "thinking_state_emitted",
-                                    session_id=session_id,
-                                    thinking_title=thinking_state["thinking_title"],
-                                    status=thinking_state["status"],
-                                    node=node_name,
-                                )
                                 yield thinking_state
                         
                         elif node_name == "tool_call":
                             # Tool execution started - use last_tool_name from previous state
+                            if previous_state_messages:
+                                last_msg = previous_state_messages[-1]
+                                if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+                                    tool_names = [tc.get("name") for tc in last_msg.tool_calls]
+                                    last_tool_name = tool_names[0] if tool_names else None
+                            
                             if last_tool_name == "duckduckgo_search":
                                 thinking_state = {
-                                    "thinking_title": "searching web",
+                                    "thinking_title": "🔍 searching web",
                                     "response": "",
                                     "status": "thinking"
                                 }
-                                logger.info(
-                                    "thinking_state_emitted",
-                                    session_id=session_id,
-                                    thinking_title=thinking_state["thinking_title"],
-                                    status=thinking_state["status"],
-                                    node=node_name,
-                                    tool_name=last_tool_name,
-                                )
                                 yield thinking_state
                             elif last_tool_name:
-                                thinking_title = f"using {last_tool_name}"
+                                thinking_title = f"🔧 using {last_tool_name}"
                                 thinking_state = {
                                     "thinking_title": thinking_title,
                                     "response": "",
                                     "status": "thinking"
                                 }
-                                logger.info(
-                                    "thinking_state_emitted",
-                                    session_id=session_id,
-                                    thinking_title=thinking_state["thinking_title"],
-                                    status=thinking_state["status"],
-                                    node=node_name,
-                                    tool_name=last_tool_name,
-                                )
                                 yield thinking_state
                             else:
                                 thinking_state = {
@@ -846,13 +1061,6 @@ class LangGraphAgent:
                                     "response": "",
                                     "status": "thinking"
                                 }
-                                logger.info(
-                                    "thinking_state_emitted",
-                                    session_id=session_id,
-                                    thinking_title=thinking_state["thinking_title"],
-                                    status=thinking_state["status"],
-                                    node=node_name,
-                                )
                                 yield thinking_state
                     
                     # Extract content from messages if available
@@ -873,12 +1081,6 @@ class LangGraphAgent:
                                                 "response": new_content,
                                                 "status": "thinking"
                                             }
-                                            logger.debug(
-                                                "content_chunk_streamed",
-                                                session_id=session_id,
-                                                chunk_length=len(new_content),
-                                                accumulated_length=len(accumulated_response),
-                                            )
                                             yield thinking_state
                                     elif current_content != sent_content:
                                         if sent_content:
@@ -897,12 +1099,6 @@ class LangGraphAgent:
                                                 "response": new_content,
                                                 "status": "thinking"
                                             }
-                                            logger.debug(
-                                                "content_chunk_streamed",
-                                                session_id=session_id,
-                                                chunk_length=len(new_content),
-                                                accumulated_length=len(accumulated_response),
-                                            )
                                             yield thinking_state
                     
                     # Update previous state for next iteration

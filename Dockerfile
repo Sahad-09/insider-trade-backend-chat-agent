@@ -26,13 +26,12 @@ RUN apt-get update && apt-get install -y \
 COPY pyproject.toml .
 RUN uv venv && . .venv/bin/activate && uv pip install -e .
 
-# Copy scripts first to fix line endings
-COPY scripts/docker-entrypoint.sh /app/scripts/docker-entrypoint.sh
-RUN sed -i 's/\r$//' /app/scripts/docker-entrypoint.sh && \
-    chmod +x /app/scripts/docker-entrypoint.sh
-
 # Copy the rest of the application
 COPY . .
+
+# Fix line endings for entrypoint script (Windows -> Unix)
+RUN sed -i 's/\r$//' /app/scripts/docker-entrypoint.sh && \
+    chmod +x /app/scripts/docker-entrypoint.sh
 
 # Create a non-root user
 RUN useradd -m appuser && chown -R appuser:appuser /app

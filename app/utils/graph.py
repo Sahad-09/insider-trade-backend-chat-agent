@@ -67,7 +67,7 @@ def process_llm_response(response: BaseMessage) -> BaseMessage:
     return response
 
 
-def prepare_messages(messages: list[Message], llm: BaseChatModel, system_prompt: str) -> list[Message]:
+def prepare_messages(messages: list[Message], llm: BaseChatModel, system_prompt: str) -> list[dict]:
     """Prepare the messages for the LLM.
 
     Args:
@@ -76,7 +76,7 @@ def prepare_messages(messages: list[Message], llm: BaseChatModel, system_prompt:
         system_prompt (str): The system prompt to use.
 
     Returns:
-        list[Message]: The prepared messages.
+        list[dict]: The prepared messages as dictionaries (bypasses Message validation for system prompts).
     """
     try:
         trimmed_messages = _trim_messages(
@@ -96,9 +96,10 @@ def prepare_messages(messages: list[Message], llm: BaseChatModel, system_prompt:
                 error=str(e),
                 message_count=len(messages),
             )
-            # Skip trimming and return all messages
-            trimmed_messages = messages
+            # Skip trimming and return all messages as dicts
+            trimmed_messages = dump_messages(messages)
         else:
             raise
 
-    return [Message(role="system", content=system_prompt)] + trimmed_messages
+    # Return as dicts to bypass Message validation (system prompts can be long)
+    return [{"role": "system", "content": system_prompt}] + trimmed_messages

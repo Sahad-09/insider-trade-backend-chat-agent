@@ -62,22 +62,6 @@ services:
       - monitoring
     restart: always
 
-  # Grafana
-  grafana:
-    image: grafana/grafana:latest
-    ports:
-      - "3000:3000"
-    volumes:
-      - grafana-storage:/var/lib/grafana
-      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
-      - ./grafana/dashboards/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_USERS_ALLOW_SIGN_UP=false
-    networks:
-      - monitoring
-    restart: always
-
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:latest
     ports:
@@ -97,5 +81,4 @@ networks:
     driver: bridge
 
 volumes:
-  grafana-storage:
   postgres-data:

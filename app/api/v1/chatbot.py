@@ -58,9 +58,15 @@ async def chat(
             "chat_request_received",
             session_id=session.id,
             message_count=len(chat_request.messages),
+            deep_analysis=chat_request.deep_analysis,
         )
 
-        result = await agent.get_response(chat_request.messages, session.id, user_id=session.user_id)
+        result = await agent.get_response(
+            chat_request.messages,
+            session.id,
+            user_id=session.user_id,
+            deep_analysis=chat_request.deep_analysis,
+        )
 
         logger.info("chat_request_processed", session_id=session.id)
 
@@ -95,6 +101,7 @@ async def chat_stream(
             "stream_chat_request_received",
             session_id=session.id,
             message_count=len(chat_request.messages),
+            deep_analysis=chat_request.deep_analysis,
         )
 
         # Get model name safely for metrics
@@ -128,9 +135,12 @@ async def chat_stream(
                     )
                     used_model = "o3-mini"
                 else:
-                    # Use regular model (gpt-4o-mini)
+                    # Use regular model (gpt-4o-mini) with optional deep analysis
                     stream_generator = agent.get_stream_response_with_thinking(
-                        chat_request.messages, session.id, user_id=session.user_id
+                        chat_request.messages,
+                        session.id,
+                        user_id=session.user_id,
+                        deep_analysis=chat_request.deep_analysis,
                     )
                     used_model = model_name
                 

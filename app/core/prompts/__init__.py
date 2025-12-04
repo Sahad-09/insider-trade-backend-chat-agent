@@ -14,3 +14,12 @@ def load_system_prompt(**kwargs):
             current_date_and_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             **kwargs,
         )
+
+
+def load_insider_analyst_prompt(**kwargs):
+    """Load the insider analyst prompt from the file."""
+    with open(os.path.join(os.path.dirname(__file__), "insider_analyst.md"), "r") as f:
+        return f.read().format(
+            current_date_and_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            **kwargs,
+        )
